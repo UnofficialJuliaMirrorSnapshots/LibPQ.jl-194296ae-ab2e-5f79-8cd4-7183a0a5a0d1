@@ -6,11 +6,28 @@ using DataFrames: eachrow
 using Decimals
 using IterTools: imap
 using Memento
+using Memento.TestUtils
 using OffsetArrays
 using TimeZones
 using Tables
 
 Memento.config!("critical")
+
+macro test_broken_on_windows(ex)
+    if Sys.iswindows()
+        :(@test_broken $(esc(ex)))
+    else
+        :(@test $(esc(ex)))
+    end
+end
+
+macro test_nolog_on_windows(ex...)
+    if Sys.iswindows()
+        :(@test_nolog($(map(esc, ex)...)))
+    else
+        :(@test_log($(map(esc, ex)...)))
+    end
+end
 
 @testset "LibPQ" begin
 
@@ -257,48 +274,96 @@ end
         close(conn)
     end
 
-    @testset "Example COPY FROM" begin
-        conn = LibPQ.Connection("dbname=postgres user=$DATABASE_USER")
+    @testset "COPY FROM" begin
+        @testset "Example COPY FROM" begin
+            conn = LibPQ.Connection("dbname=postgres user=$DATABASE_USER")
 
-        result = execute(conn, """
-            CREATE TEMPORARY TABLE libpqjl_test (
-                no_nulls    varchar(10) PRIMARY KEY,
-                yes_nulls   varchar(10)
-            );
-        """)
-        @test status(result) == LibPQ.libpq_c.PGRES_COMMAND_OK
-        close(result)
+            result = execute(conn, """
+                CREATE TEMPORARY TABLE libpqjl_test (
+                    no_nulls    varchar(10) PRIMARY KEY,
+                    yes_nulls   varchar(10)
+                );
+            """)
+            @test status(result) == LibPQ.libpq_c.PGRES_COMMAND_OK
+            close(result)
 
-        no_nulls = map(string, 'a':'z')
-        yes_nulls = Union{String, Missing}[isodd(Int(c)) ? string(c) : missing for c in 'a':'z']
-        data = DataFrame(no_nulls=no_nulls, yes_nulls=yes_nulls)
+            no_nulls = map(string, 'a':'z')
+            yes_nulls = Union{String, Missing}[isodd(Int(c)) ? string(c) : missing for c in 'a':'z']
+            data = DataFrame(no_nulls=no_nulls, yes_nulls=yes_nulls)
 
-        row_strings = imap(eachrow(data)) do row
-            if ismissing(row[:yes_nulls])
-                "$(row[:no_nulls]),\n"
-            else
-                "$(row[:no_nulls]),$(row[:yes_nulls])\n"
+            row_strings = imap(eachrow(data)) do row
+                if ismissing(row[:yes_nulls])
+                    "$(row[:no_nulls]),\n"
+                else
+                    "$(row[:no_nulls]),$(row[:yes_nulls])\n"
+                end
             end
+
+            copyin = LibPQ.CopyIn("COPY libpqjl_test FROM STDIN (FORMAT CSV);", row_strings)
+
+            result = execute(conn, copyin)
+            @test isopen(result)
+            @test status(result) == LibPQ.libpq_c.PGRES_COMMAND_OK
+            @test isempty(LibPQ.error_message(result))
+            close(result)
+
+            result = execute(
+                conn,
+                "SELECT no_nulls, yes_nulls FROM libpqjl_test ORDER BY no_nulls ASC;";
+                throw_error=true
+            )
+            table_data = DataFrame(result)
+            @test isequal(table_data, data)
+            close(result)
+
+            close(conn)
         end
 
-        copyin = LibPQ.CopyIn("COPY libpqjl_test FROM STDIN (FORMAT CSV);", row_strings)
+        @testset "Wrong column order" begin
+            conn = LibPQ.Connection("dbname=postgres user=$DATABASE_USER")
 
-        result = execute(conn, copyin)
-        @test isopen(result)
-        @test status(result) == LibPQ.libpq_c.PGRES_COMMAND_OK
-        @test isempty(LibPQ.error_message(result))
-        close(result)
+            result = execute(conn, """
+                CREATE TEMPORARY TABLE libpqjl_test (
+                    pri    bigint PRIMARY KEY,
+                    sec    varchar(10)
+                );
+            """)
+            @test status(result) == LibPQ.libpq_c.PGRES_COMMAND_OK
+            close(result)
 
-        result = execute(
-            conn,
-            "SELECT no_nulls, yes_nulls FROM libpqjl_test ORDER BY no_nulls ASC;";
-            throw_error=true
-        )
-        table_data = DataFrame(result)
-        @test isequal(table_data, data)
-        close(result)
+            data = (pri = 1:26, sec = map(string, 'a':'z'))
 
-        close(conn)
+            row_strings = imap(Tables.rows(data)) do row
+                "$(row.sec),$(row.pri)\n"
+            end
+
+            copyin = LibPQ.CopyIn("COPY libpqjl_test FROM STDIN (FORMAT CSV);", row_strings)
+
+            result = execute(conn, copyin; throw_error=false)
+            @test isopen(result)
+            @test status(result) == LibPQ.libpq_c.PGRES_FATAL_ERROR
+            @test occursin("ERROR", LibPQ.error_message(result))
+            @test occursin("invalid input syntax for integer", LibPQ.error_message(result))
+            close(result)
+
+            result = execute(
+                conn,
+                "SELECT pri, sec FROM libpqjl_test ORDER BY pri ASC;";
+                throw_error=true
+            )
+            table_data = columntable(result)
+            @test isequal(table_data, (pri = Int[], sec = String[]))
+            close(result)
+
+            row_strings = imap(Tables.rows(data)) do row
+                "$(row.sec),$(row.pri)\n"
+            end
+
+            copyin = LibPQ.CopyIn("COPY libpqjl_test FROM STDIN (FORMAT CSV);", row_strings)
+            @test_throws ErrorException execute(conn, copyin; throw_error=true)
+
+            close(conn)
+        end
     end
 
     @testset "LibPQ.Connection" begin
@@ -367,6 +432,107 @@ end
             results = columntable(execute(conn, "SELECT '1 12:59:10'::interval;"))
             @test results[1][1] == "@ 1 day 12 hours 59 mins 10 secs"
             close(conn)
+        end
+
+        @testset "Time Zone" begin
+            function connection_tz(conn::LibPQ.Connection)
+                result = execute(conn, "SELECT current_setting('TIMEZONE');")
+
+                tz = columntable(result)[:current_setting][1]
+                close(result)
+                return tz
+            end
+
+            # test with rare time zones to avoid collision with actual server time zones
+            # NOTE: do not run tests in Greenland
+            default_tz = LibPQ.DEFAULT_CLIENT_TIME_ZONE[]
+            try
+                LibPQ.DEFAULT_CLIENT_TIME_ZONE[] = "America/Scoresbysund"
+                LibPQ.CONNECTION_OPTION_DEFAULTS["TimeZone"] = LibPQ.DEFAULT_CLIENT_TIME_ZONE[]
+                merge!(LibPQ.CONNECTION_PARAMETER_DEFAULTS, LibPQ._connection_parameter_dict(connection_options=LibPQ.CONNECTION_OPTION_DEFAULTS))
+                withenv("PGTZ" => nothing) do  # unset
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER"; throw_error=true
+                    ) do conn
+                        @test connection_tz(conn) == "America/Scoresbysund"
+                    end
+
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER";
+                        options=Dict("TimeZone" => "America/Danmarkshavn"),
+                        throw_error=true,
+                    ) do conn
+                        @test connection_tz(conn) == "America/Danmarkshavn"
+                    end
+
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER";
+                        options=Dict("TimeZone" => ""),
+                        throw_error=true,
+                    ) do conn
+                        @test connection_tz(conn) != "America/Scoresbysund"
+                        @test connection_tz(conn) != "America/Danmarkshavn"
+                    end
+                end
+
+                # For some reason, libpq won't pick up environment variables which are set
+                # after it has been loaded. This seems to happen with Julia only; psycopg2
+                # does not have this problem. Perhaps we need to set some dlopen option?
+                withenv("PGTZ" => "America/Thule") do
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER"; throw_error=true
+                    ) do conn
+                        @test_broken_on_windows connection_tz(conn) == "America/Thule"
+                    end
+
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER";
+                        options=Dict("TimeZone" => "America/Danmarkshavn"),
+                        throw_error=true,
+                    ) do conn
+                        @test_broken_on_windows connection_tz(conn) == "America/Thule"
+                    end
+
+                    LibPQ.Connection(
+                        "dbname=postgres user=$DATABASE_USER";
+                        options=Dict("TimeZone" => ""),
+                        throw_error=true,
+                    ) do conn
+                        @test_broken_on_windows connection_tz(conn) == "America/Thule"
+                    end
+                end
+
+                withenv("PGTZ" => "") do
+                    @test_nolog_on_windows LibPQ.LOGGER "error" "invalid value for parameter" try
+                        LibPQ.Connection(
+                            "dbname=postgres user=$DATABASE_USER"; throw_error=true
+                        )
+                    catch
+                    end
+
+                    @test_nolog_on_windows LibPQ.LOGGER "error" "invalid value for parameter" try
+                        LibPQ.Connection(
+                            "dbname=postgres user=$DATABASE_USER";
+                            options=Dict("TimeZone" => "America/Danmarkshavn"),
+                            throw_error=true,
+                        )
+                    catch
+                    end
+
+                    @test_nolog_on_windows LibPQ.LOGGER "error" "invalid value for parameter" try
+                        LibPQ.Connection(
+                            "dbname=postgres user=$DATABASE_USER";
+                            options=Dict("TimeZone" => ""),
+                            throw_error=true,
+                        )
+                    catch
+                    end
+                end
+            finally
+                LibPQ.DEFAULT_CLIENT_TIME_ZONE[] = default_tz
+                LibPQ.CONNECTION_OPTION_DEFAULTS["TimeZone"] = LibPQ.DEFAULT_CLIENT_TIME_ZONE[]
+                merge!(LibPQ.CONNECTION_PARAMETER_DEFAULTS, LibPQ._connection_parameter_dict(connection_options=LibPQ.CONNECTION_OPTION_DEFAULTS))
+            end
         end
 
         @testset "Bad Connection" begin
