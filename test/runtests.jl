@@ -430,6 +430,7 @@ end
                 "dbname=postgres user=$DATABASE_USER";
                 options=Dict("IntervalStyle" => "postgres_verbose"),
                 throw_error=true,
+                type_map=Dict(:interval => String),
             )
 
             conn_info = LibPQ.conninfo(conn)
@@ -843,6 +844,24 @@ end
             close(conn)
         end
 
+        @testset "Uppercase Columns" begin
+            conn = LibPQ.Connection("dbname=postgres user=$DATABASE_USER"; throw_error=true)
+
+            result = execute(conn, "SELECT 1 AS \"Column\";")
+            @test num_columns(result) == 1
+            @test LibPQ.column_name(result, 1) == "Column"
+            @test LibPQ.column_number(result, :Column) == 1
+
+            table = Tables.columntable(result)
+            @test :Column in propertynames(table)
+
+            table = Tables.rowtable(result)
+            @test :Column in propertynames(table[1])
+
+            close(result)
+            close(conn)
+        end
+
         @testset "PQResultError" begin
             conn = LibPQ.Connection("dbname=postgres user=$DATABASE_USER"; throw_error=true)
 
@@ -866,6 +885,14 @@ end
             @test length(verbose_err.verbose_msg) > length(err.msg)
 
             close(result)
+
+            result = execute(conn, "SELECT 1;")
+            unknown_error = LibPQ.Errors.PQResultError(result; verbose=true)
+            @test unknown_error isa LibPQ.Errors.UnknownErrorClass
+            @test unknown_error isa LibPQ.Errors.UnknownError
+            @test occursin("PGresult is not an error result", unknown_error.verbose_msg)
+            close(result)
+
             close(conn)
         end
 
@@ -983,12 +1010,28 @@ end
                         ("'infinity'::timestamp", typemax(DateTime)),
                         ("'-infinity'::timestamp", typemin(DateTime)),
                         ("'epoch'::timestamp", DateTime(1970, 1, 1, 0, 0, 0)),
-                        # ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54-00'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC")),
-                        # ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54-02'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC-2")),
-                        # ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54+10'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC+10")),
+                        ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54-00'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC")),
+                        ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54-02'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC-2")),
+                        ("TIMESTAMP WITH TIME ZONE '2004-10-19 10:23:54+10'", ZonedDateTime(2004, 10, 19, 10, 23, 54, tz"UTC+10")),
                         ("'infinity'::timestamptz", ZonedDateTime(typemax(DateTime), tz"UTC")),
                         ("'-infinity'::timestamptz", ZonedDateTime(typemin(DateTime), tz"UTC")),
-                        # ("'epoch'::timestamptz", ZonedDateTime(1970, 1, 1, 0, 0, 0, tz"UTC")),
+                        ("'epoch'::timestamptz", ZonedDateTime(1970, 1, 1, 0, 0, 0, tz"UTC")),
+                        ("DATE '2017-01-31'", Date(2017, 1, 31)),
+                        ("'infinity'::date", typemax(Date)),
+                        ("'-infinity'::date", typemin(Date)),
+                        ("TIME '13:13:13.131'", Time(13, 13, 13, 131)),
+                        ("TIME '13:13:13.131242'", Time(13, 13, 13, 131)),
+                        ("TIME '01:01:01'", Time(1, 1, 1)),
+                        ("'allballs'::time", Time(0, 0, 0)),
+                        ("INTERVAL '1 year 2 months 3 days 4 hours 5 minutes 6 seconds'", Dates.CompoundPeriod(Period[Year(1), Month(2), Day(3), Hour(4), Minute(5), Second(6)])),
+                        ("INTERVAL '6.1 seconds'", Dates.CompoundPeriod(Period[Second(6), Millisecond(100)])),
+                        ("INTERVAL '6.01 seconds'", Dates.CompoundPeriod(Period[Second(6), Millisecond(10)])),
+                        ("INTERVAL '6.001 seconds'", Dates.CompoundPeriod(Period[Second(6), Millisecond(1)])),
+                        ("INTERVAL '6.0001 seconds'", Dates.CompoundPeriod(Period[Second(6), Microsecond(100)])),
+                        ("INTERVAL '6.1001 seconds'", Dates.CompoundPeriod(Period[Second(6), Microsecond(100100)])),
+                        ("INTERVAL '1000 years 7 weeks'", Dates.CompoundPeriod(Period[Year(1000), Day(7 * 7)])),
+                        ("INTERVAL '1 day -1 hour'", Dates.CompoundPeriod(Period[Day(1), Hour(-1)])),
+                        ("INTERVAL '-1 month 1 day'", Dates.CompoundPeriod(Period[Month(-1), Day(1)])),
                         ("'{{{1,2,3},{4,5,6}}}'::int2[]", Array{Union{Int16, Missing}}(reshape(Int16[1 2 3; 4 5 6], 1, 2, 3))),
                         ("'{}'::int2[]", Union{Missing, Int16}[]),
                         ("'{{{1,2,3},{4,5,6}}}'::int4[]", Array{Union{Int32, Missing}}(reshape(Int32[1 2 3; 4 5 6], 1, 2, 3))),
@@ -1069,6 +1112,24 @@ end
                     end
 
                     close(conn)
+                end
+
+                @testset "Interval Regex" begin
+                    regex = LibPQ.INTERVAL_REGEX[]
+                    inputs = [
+                        "P1Y2M3DT4H5M6S",
+                        "PT6.1S",
+                        "PT6.01S",
+                        "PT6.001S",
+                        "PT6.0001S",
+                        "PT6.1001S",
+                        "P100Y49D",
+                        "P1DT-1H",
+                        "P-1M1D",
+                    ]
+                    for input in inputs
+                        @test match(regex, input) !== nothing
+                    end
                 end
             end
         end
